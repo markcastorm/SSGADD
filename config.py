@@ -57,7 +57,7 @@ SELECTORS = {
     # Table with fund data
     'data_table': 'table.tb-keyvalue',
     'table_rows': 'tr',
-    'label_cell': 'td.label',
+    'label_cell': 'th.label',
     'data_cell': 'td.data',
 
     # Specific target
@@ -158,7 +158,7 @@ LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 # BROWSER CONFIGURATION
 # =============================================================================
 
-HEADLESS_MODE = True
+HEADLESS_MODE = False
 DEBUG_MODE = True
 WAIT_TIMEOUT = 20
 PAGE_LOAD_DELAY = 3

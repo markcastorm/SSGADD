@@ -9,7 +9,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
-from selenium.common.exceptions import TimeoutException, NoSuchElementException
+from selenium.common.exceptions import (
+    TimeoutException,
+    NoSuchElementException,
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+)
 from bs4 import BeautifulSoup
 import config
 
@@ -43,33 +48,75 @@ class SSGADDScraper:
 
         self.logger.info("Chrome driver initialized")
 
+    def _get_element_text(self, element):
+        """
+        Get text from an element using multiple strategies.
+        Selenium's .text can return empty if the element is not fully visible.
+        Falls back to textContent/innerText via JavaScript.
+        """
+        text = element.text.strip()
+        if text:
+            return text
+
+        # Fallback: use JavaScript to get textContent
+        text = self.driver.execute_script(
+            "return arguments[0].textContent;", element
+        )
+        if text:
+            return text.strip()
+
+        # Fallback: use innerText
+        text = self.driver.execute_script(
+            "return arguments[0].innerText;", element
+        )
+        return text.strip() if text else ''
+
+    def _js_click(self, element):
+        """Click an element via JavaScript (bypasses overlays)."""
+        self.driver.execute_script("arguments[0].click();", element)
+
     def handle_cookie_modal(self):
         """
-        Handle the SSGA cookie consent modal.
-        Clicks the "Accept and Save Cookies" button.
+        Handle the SSGA cookie/self-identifier consent modal.
+        Waits for the modal, clicks "Accept and Save Cookies",
+        and waits for the modal to fully disappear before continuing.
         """
 
         self.logger.info("Checking for cookie modal...")
 
         try:
-            # Wait for cookie modal to appear
             wait = WebDriverWait(self.driver, config.COOKIE_MODAL_WAIT)
 
-            # Look for the modal
+            # Wait for modal to be visible
             modal = wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, config.SELECTORS['cookie_modal']))
+                EC.visibility_of_element_located((By.CSS_SELECTOR, config.SELECTORS['cookie_modal']))
             )
-
             self.logger.info("Cookie modal detected")
 
-            # Find and click the accept button
-            accept_button = self.driver.find_element(By.CSS_SELECTOR, config.SELECTORS['cookie_accept_button'])
+            # Wait for the accept button to be clickable
+            accept_button = WebDriverWait(self.driver, config.COOKIE_MODAL_WAIT).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, config.SELECTORS['cookie_accept_button']))
+            )
 
-            if accept_button:
+            # Try normal click first, fall back to JS click
+            try:
                 accept_button.click()
-                self.logger.info("Clicked 'Accept and Save Cookies' button")
-                time.sleep(2)  # Wait for modal to close
-                return True
+            except ElementClickInterceptedException:
+                self.logger.info("Normal click intercepted, using JS click")
+                self._js_click(accept_button)
+
+            self.logger.info("Clicked 'Accept and Save Cookies' button")
+
+            # Wait for the modal to fully disappear
+            try:
+                WebDriverWait(self.driver, 10).until(
+                    EC.invisibility_of_element_located((By.CSS_SELECTOR, config.SELECTORS['cookie_modal']))
+                )
+                self.logger.info("Cookie modal dismissed successfully")
+            except TimeoutException:
+                self.logger.warning("Modal did not disappear, attempting to continue anyway")
+
+            return True
 
         except TimeoutException:
             self.logger.info("No cookie modal appeared (may have been accepted previously)")
@@ -79,7 +126,7 @@ class SSGADDScraper:
             return False
 
     def navigate_to_page(self, url):
-        """Navigate to the ETF page"""
+        """Navigate to the ETF page and handle any modal that appears."""
 
         self.logger.info(f"Navigating to {url}")
 
@@ -87,152 +134,265 @@ class SSGADDScraper:
             self.driver.get(url)
             time.sleep(config.PAGE_LOAD_DELAY)
             self.logger.info("Page loaded successfully")
+
+            # Handle cookie modal on every page load (it can reappear)
+            self.handle_cookie_modal()
+
             return True
 
         except Exception as e:
             self.logger.error(f"Error loading page: {e}")
             return False
 
+    def _wait_for_fund_characteristics(self):
+        """
+        Wait for Fund Characteristics section to be present and visible.
+        Returns the matching section element or None.
+        """
+        try:
+            wait = WebDriverWait(self.driver, config.WAIT_TIMEOUT)
+            sections = wait.until(
+                EC.presence_of_all_elements_located(
+                    (By.CSS_SELECTOR, config.SELECTORS['fund_characteristics_section'])
+                )
+            )
+
+            for section in sections:
+                try:
+                    title = section.find_element(By.CSS_SELECTOR, config.SELECTORS['section_title'])
+                except NoSuchElementException:
+                    continue
+
+                title_text = self._get_element_text(title)
+                if 'Fund Characteristics' in title_text:
+                    return section
+
+        except TimeoutException:
+            self.logger.warning("Timed out waiting for fund sections to load")
+        except Exception as e:
+            self.logger.warning(f"Error waiting for fund characteristics: {e}")
+
+        return None
+
     def scroll_to_fund_characteristics(self):
         """Scroll down to Fund Characteristics section"""
 
         self.logger.info("Scrolling to Fund Characteristics section...")
 
-        try:
-            # Find the Fund Characteristics section
-            sections = self.driver.find_elements(By.CSS_SELECTOR, config.SELECTORS['fund_characteristics_section'])
+        section = self._wait_for_fund_characteristics()
+        if section:
+            self.driver.execute_script(
+                "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
+                section
+            )
+            time.sleep(config.SCROLL_DELAY)
+            self.logger.info("Scrolled to Fund Characteristics section")
+            return True
 
-            for section in sections:
-                title = section.find_element(By.CSS_SELECTOR, config.SELECTORS['section_title'])
-                if 'Fund Characteristics' in title.text:
-                    # Scroll element into view
-                    self.driver.execute_script(
-                        "arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});",
-                        section
-                    )
-                    time.sleep(config.SCROLL_DELAY)
-                    self.logger.info("Scrolled to Fund Characteristics section")
-                    return True
-
-            self.logger.warning("Fund Characteristics section not found")
-            return False
-
-        except Exception as e:
-            self.logger.error(f"Error scrolling to section: {e}")
-            return False
+        self.logger.warning("Fund Characteristics section not found")
+        return False
 
     def extract_fund_data(self, product_key):
         """
         Extract the "as of" date and Option Adjusted Duration value.
 
-        Args:
-            product_key: Product identifier (JNK or SPIB)
-
-        Returns:
-            dict with 'date', 'duration', and 'raw_html'
+        Uses multiple strategies:
+        1. Selenium element text
+        2. JavaScript textContent fallback
+        3. BeautifulSoup HTML parsing as final fallback
         """
 
         self.logger.info(f"Extracting fund data for {product_key}...")
 
+        # Strategy 1: Selenium with text fallbacks
+        data = self._extract_via_selenium(product_key)
+        if data:
+            return data
+
+        # Strategy 2: Parse page source with BeautifulSoup as fallback
+        self.logger.info(f"Selenium extraction failed, trying BeautifulSoup fallback for {product_key}")
+        data = self._extract_via_beautifulsoup(product_key)
+        if data:
+            return data
+
+        self.logger.error(f"Could not find Option Adjusted Duration for {product_key}")
+        return None
+
+    def _extract_via_selenium(self, product_key):
+        """Extract fund data using Selenium elements with text fallbacks."""
         try:
-            # Find the Fund Characteristics section
-            sections = self.driver.find_elements(By.CSS_SELECTOR, config.SELECTORS['fund_characteristics_section'])
+            section = self._wait_for_fund_characteristics()
+            if not section:
+                return None
 
-            for section in sections:
-                title_elem = section.find_element(By.CSS_SELECTOR, config.SELECTORS['section_title'])
+            title_elem = section.find_element(By.CSS_SELECTOR, config.SELECTORS['section_title'])
 
-                if 'Fund Characteristics' in title_elem.text:
-                    # Extract the "as of" date
-                    date_str = None
-                    try:
-                        date_span = title_elem.find_element(By.CSS_SELECTOR, config.SELECTORS['date_span'])
-                        date_str = date_span.text.strip()
-                        # Remove "as of " prefix if present
-                        if date_str.lower().startswith('as of '):
-                            date_str = date_str[6:].strip()
-                        self.logger.info(f"Found date: {date_str}")
-                    except NoSuchElementException:
-                        self.logger.warning("Could not find date span")
+            # Extract the "as of" date
+            date_str = None
+            try:
+                date_span = title_elem.find_element(By.CSS_SELECTOR, config.SELECTORS['date_span'])
+                date_str = self._get_element_text(date_span)
+                if date_str.lower().startswith('as of '):
+                    date_str = date_str[6:].strip()
+                self.logger.info(f"Found date: {date_str}")
+            except NoSuchElementException:
+                self.logger.warning("Could not find date span")
 
-                    # Extract Option Adjusted Duration
-                    table = section.find_element(By.CSS_SELECTOR, config.SELECTORS['data_table'])
-                    rows = table.find_elements(By.CSS_SELECTOR, config.SELECTORS['table_rows'])
+            # Extract Option Adjusted Duration from table
+            table = section.find_element(By.CSS_SELECTOR, config.SELECTORS['data_table'])
+            rows = table.find_elements(By.CSS_SELECTOR, config.SELECTORS['table_rows'])
 
-                    for row in rows:
+            target_label = config.SELECTORS['option_adjusted_duration_label']
+
+            for row in rows:
+                try:
+                    # Try configured selector first, then fallback to th or td
+                    label_cell = None
+                    for selector in [config.SELECTORS['label_cell'], 'th.label', 'td.label', 'th', 'td:first-child']:
                         try:
-                            label_cell = row.find_element(By.CSS_SELECTOR, config.SELECTORS['label_cell'])
-                            label_text = label_cell.text.strip()
-
-                            # Check if this is the Option Adjusted Duration row
-                            if config.SELECTORS['option_adjusted_duration_label'] in label_text:
-                                data_cell = row.find_element(By.CSS_SELECTOR, config.SELECTORS['data_cell'])
-                                duration_str = data_cell.text.strip()
-
-                                self.logger.info(f"Found Option Adjusted Duration: {duration_str}")
-
-                                # Get the HTML for debugging
-                                section_html = section.get_attribute('outerHTML')
-
-                                return {
-                                    'product': product_key,
-                                    'date_str': date_str,
-                                    'duration_str': duration_str,
-                                    'raw_html': section_html
-                                }
-
+                            label_cell = row.find_element(By.CSS_SELECTOR, selector)
+                            break
                         except NoSuchElementException:
                             continue
 
-            self.logger.error(f"Could not find Option Adjusted Duration for {product_key}")
-            return None
+                    if not label_cell:
+                        continue
+
+                    label_text = self._get_element_text(label_cell)
+
+                    if target_label in label_text:
+                        # Try configured selector first, then fallbacks
+                        data_cell = None
+                        for selector in [config.SELECTORS['data_cell'], 'td.data', 'td:last-child']:
+                            try:
+                                data_cell = row.find_element(By.CSS_SELECTOR, selector)
+                                break
+                            except NoSuchElementException:
+                                continue
+
+                        if not data_cell:
+                            continue
+
+                        duration_str = self._get_element_text(data_cell)
+                        self.logger.info(f"Found Option Adjusted Duration: {duration_str}")
+
+                        section_html = section.get_attribute('outerHTML')
+
+                        return {
+                            'product': product_key,
+                            'date_str': date_str,
+                            'duration_str': duration_str,
+                            'raw_html': section_html
+                        }
+
+                except (NoSuchElementException, StaleElementReferenceException):
+                    continue
 
         except Exception as e:
-            self.logger.error(f"Error extracting fund data: {e}")
-            return None
+            self.logger.warning(f"Selenium extraction error: {e}")
+
+        return None
+
+    def _extract_via_beautifulsoup(self, product_key):
+        """
+        Fallback: parse the full page source with BeautifulSoup.
+        This works even when Selenium .text returns empty due to overlays or rendering issues.
+        """
+        try:
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+
+            # Find all fund characteristic sections
+            sections = soup.find_all('div', class_='keyvalue')
+
+            for section in sections:
+                title = section.find(['h2', 'h3'], class_='comp-title')
+                if not title or 'Fund Characteristics' not in title.get_text():
+                    continue
+
+                # Extract date
+                date_str = None
+                date_span = title.find('span', class_='date')
+                if date_span:
+                    date_str = date_span.get_text(strip=True)
+                    if date_str.lower().startswith('as of '):
+                        date_str = date_str[6:].strip()
+                    self.logger.info(f"[BS4] Found date: {date_str}")
+
+                # Extract Option Adjusted Duration from table
+                table = section.find('table', class_='tb-keyvalue')
+                if not table:
+                    continue
+
+                target_label = config.SELECTORS['option_adjusted_duration_label']
+
+                for row in table.find_all('tr'):
+                    label_cell = row.find(['th', 'td'], class_='label')
+                    if not label_cell:
+                        continue
+
+                    label_text = label_cell.get_text(strip=True)
+                    if target_label not in label_text:
+                        continue
+
+                    data_cell = row.find('td', class_='data')
+                    if not data_cell:
+                        continue
+
+                    duration_str = data_cell.get_text(strip=True)
+                    self.logger.info(f"[BS4] Found Option Adjusted Duration: {duration_str}")
+
+                    section_html = str(section)
+
+                    return {
+                        'product': product_key,
+                        'date_str': date_str,
+                        'duration_str': duration_str,
+                        'raw_html': section_html
+                    }
+
+        except Exception as e:
+            self.logger.warning(f"BeautifulSoup extraction error: {e}")
+
+        return None
 
     def scrape_product(self, product_key, url):
         """
-        Scrape data for a single product.
-
-        Args:
-            product_key: Product identifier (JNK or SPIB)
-            url: URL to scrape
-
-        Returns:
-            dict with scraped data or None
+        Scrape data for a single product with retry support.
         """
 
         self.logger.info(f"\n{'='*70}")
         self.logger.info(f"Scraping {product_key}: {url}")
         self.logger.info(f"{'='*70}")
 
-        try:
-            # Navigate to page
-            if not self.navigate_to_page(url):
-                self.logger.error(f"Failed to load page for {product_key}")
-                return None
+        for attempt in range(1, config.MAX_RETRIES + 1):
+            try:
+                if attempt > 1:
+                    self.logger.info(f"Retry attempt {attempt}/{config.MAX_RETRIES} for {product_key}")
+                    time.sleep(config.RETRY_DELAY)
 
-            # Handle cookie modal (only needed on first page)
-            if product_key == 'JNK':  # Only handle on first product
-                self.handle_cookie_modal()
+                # Navigate to page (also handles cookie modal)
+                if not self.navigate_to_page(url):
+                    self.logger.error(f"Failed to load page for {product_key}")
+                    continue
 
-            # Scroll to Fund Characteristics section
-            if not self.scroll_to_fund_characteristics():
-                self.logger.warning(f"Could not scroll to Fund Characteristics for {product_key}")
+                # Scroll to Fund Characteristics section
+                if not self.scroll_to_fund_characteristics():
+                    self.logger.warning(f"Could not scroll to Fund Characteristics for {product_key}")
 
-            # Extract data
-            data = self.extract_fund_data(product_key)
+                # Extract data
+                data = self.extract_fund_data(product_key)
 
-            if data:
-                self.logger.info(f"Successfully scraped {product_key}")
-                return data
-            else:
-                self.logger.error(f"Failed to extract data for {product_key}")
-                return None
+                if data:
+                    self.logger.info(f"Successfully scraped {product_key}")
+                    return data
+                else:
+                    self.logger.warning(f"Extraction returned no data for {product_key} (attempt {attempt})")
 
-        except Exception as e:
-            self.logger.error(f"Error scraping {product_key}: {e}")
-            return None
+            except Exception as e:
+                self.logger.error(f"Error scraping {product_key} (attempt {attempt}): {e}")
+
+        self.logger.error(f"Failed to extract data for {product_key} after {config.MAX_RETRIES} attempts")
+        return None
 
     def scrape_all_products(self):
         """
